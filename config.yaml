@@ -1,0 +1,24 @@
+dataset:
+  target_genres: 10
+  target_songs_per_genre: 15
+  segments_per_song: 2
+  max_songs_per_artist: 2
+  sample_rate: 22050
+  channels: 1 # mono
+  segment_duration_sec: 10.0
+
+quality_thresholds:
+  max_silence_ratio: 0.3
+  max_clipping_ratio: 0.01
+  min_rms_dbfs: -45
+  min_duration_tolerance_sec: 0.5
+
+environment_constraints:
+  min_environment_types: 3
+  min_non_clean_ratio: 0.5
+
+paths:
+  gtzan_reference: "data/gtzan_reference/"
+  local_audio: "data/local_audio/"
+  quarantine: "data/quarantine/"
+  output: "data/final_dataset/"
