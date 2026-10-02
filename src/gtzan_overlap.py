@@ -1,93 +1,176 @@
 import os
+import json
 import logging
-from typing import Tuple, Dict, Optional, List
-import pandas as pd
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional, List
 from rapidfuzz import fuzz
-import pyacoustid
 
 logger = logging.getLogger(__name__)
 
-class GTZANOverlapChecker:
-    def __init__(self, gtzan_audio_dir: str, gtzan_meta_path: Optional[str] = None):
-        """
-        Khởi tạo checker. 
-        Giả định bắt buộc: Người dùng phải tự cung cấp bản GTZAN hợp pháp tại gtzan_audio_dir.
-        """
-        self.gtzan_audio_dir = gtzan_audio_dir
-        self.gtzan_metadata = self._load_metadata(gtzan_meta_path)
-        self.reference_fingerprints = self._build_audio_fingerprints()
+class GTZANOverlapDetector:
+    def __init__(self, config):
+        self.cfg = config
+        # Hỗ trợ trực tiếp thư mục genres_original của bạn nếu gtzan_reference chưa cập nhật
+        ref_path_str = self.cfg.paths.get('gtzan_reference', 'data/genres_original')
+        self.ref_dir = Path(ref_path_str)
+        self.cache_path = self.cfg.paths.get('interim', Path('data/interim')) / 'gtzan_fingerprints_cache.json'
+        
+        self.reference_fps = {}
+        self.is_reference_complete = False
+        self.metadata_db = [] # Chứa các chuỗi normalize "artist title" nếu có metadata bổ sung
+        
+        self.has_fpcalc = self._check_fpcalc()
 
-    def _load_metadata(self, meta_path: Optional[str]) -> Optional[pd.DataFrame]:
-        if meta_path and os.path.exists(meta_path):
+    def _check_fpcalc(self) -> bool:
+        try:
+            subprocess.run(['fpcalc', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
+
+    def _get_raw_fingerprint(self, filepath: str) -> List[int]:
+        if not self.has_fpcalc:
+            raise RuntimeError("Lệnh fpcalc không tồn tại trong hệ thống")
+        cmd = ['fpcalc', '-raw', '-json', str(filepath)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        if res.returncode != 0:
+            raise RuntimeError(f"Lỗi chạy fpcalc: {res.stderr}")
+        data = json.loads(res.stdout)
+        return data.get('fingerprint', [])
+
+    def load_references(self):
+        if not self.ref_dir.exists():
+            logger.warning(f"Không tìm thấy thư mục GTZAN tham chiếu tại {self.ref_dir}. Tất cả đánh giá sẽ trả về 'unknown'.")
+            return
+
+        audio_files = []
+        # Tìm đệ quy trong tất cả các thư mục con (blues, pop,...)
+        for ext in ('*.wav', '*.au'):
+            audio_files.extend(self.ref_dir.rglob(ext))
+
+        if len(audio_files) == 0:
+            logger.warning(f"Thư mục {self.ref_dir} tồn tại nhưng không có file âm thanh. Tất cả đánh giá sẽ trả về 'unknown'.")
+            return
+
+        if len(audio_files) < self.cfg.min_reference_files:
+            logger.warning(f"Số lượng file tham chiếu ({len(audio_files)}) nhỏ hơn yêu cầu ({self.cfg.min_reference_files}). Đánh dấu là chưa hoàn chỉnh.")
+            self.is_reference_complete = False
+        else:
+            self.is_reference_complete = True
+
+        cache = {}
+        if self.cache_path.exists():
             try:
-                df = pd.read_csv(meta_path)
-                logger.info(f"Đã load {len(df)} records từ metadata GTZAN bổ sung.")
-                return df
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
             except Exception as e:
-                logger.warning(f"Lỗi đọc GTZAN metadata: {e}")
-        logger.warning("Không tìm thấy GTZAN metadata bổ sung. Mọi so khớp văn bản sẽ trả về UNKNOWN.")
-        return None
+                logger.error(f"Lỗi đọc cache: {e}")
 
-    def _build_audio_fingerprints(self) -> Dict[str, bytes]:
-        """
-        Quét thư mục GTZAN gốc (nếu có) để tạo fingerprint.
-        Chỉ chạy 1 lần khi khởi tạo pipeline để tối ưu tốc độ.
-        """
-        fingerprints = {}
-        if not os.path.exists(self.gtzan_audio_dir):
-            logger.warning(f"Thư mục GTZAN {self.gtzan_audio_dir} không tồn tại. So khớp audio = UNKNOWN.")
-            return fingerprints
+        if not self.has_fpcalc:
+            logger.warning("Không tìm thấy lệnh `fpcalc`. Bỏ qua tạo fingerprint cho GTZAN.")
+            self.reference_fps = cache
+            return
 
-        valid_exts = ('.wav', '.au')
-        for root, _, files in os.walk(self.gtzan_audio_dir):
-            for file in files:
-                if file.lower().endswith(valid_exts):
-                    path = os.path.join(root, file)
-                    try:
-                        # Trả về duration và fingerprint (mảng bytes)
-                        duration, fp = pyacoustid.fingerprint_file(path)
-                        fingerprints[file] = fp
-                    except Exception as e:
-                        logger.debug(f"Không thể fingerprint file {file}: {e}")
-                        
-        logger.info(f"Đã tạo {len(fingerprints)} audio fingerprints từ GTZAN reference.")
-        return fingerprints
+        new_cache = {}
+        cache_updated = False
 
-    def check_overlap(self, artist: str, title: str, audio_path: Optional[str] = None) -> Tuple[str, str, bool]:
-        """
-        Kiểm tra trùng lặp.
-        Returns:
-            Tuple[overlap_status (true/false/unknown), reason, review_required]
-        """
-        # 1. Kiểm tra bằng Audio Fingerprint (Độ tin cậy cao nhất)
-        if audio_path and os.path.exists(audio_path) and self.reference_fingerprints:
+        for fp in audio_files:
+            path_str = str(fp.resolve())
             try:
-                _, candidate_fp = pyacoustid.fingerprint_file(audio_path)
-                for ref_name, ref_fp in self.reference_fingerprints.items():
-                    # So sánh byte similarity cơ bản. 
-                    # Nếu giống nhau > 90% (hoặc identical), coi như trùng file audio.
-                    similarity = fuzz.ratio(candidate_fp, ref_fp)
-                    if similarity > 90:
-                        return "true", f"Audio fingerprint trùng với GTZAN gốc ({ref_name})", False
-            except pyacoustid.FingerprintGenerationError:
-                pass # Bỏ qua nếu không parse được file, rớt xuống check metadata
+                stat = fp.stat()
+                size = stat.st_size
+                mtime = stat.st_mtime
 
-        # 2. Kiểm tra bằng Metadata (Fuzzy Matching)
-        if self.gtzan_metadata is not None:
-            # Giả định file metadata bổ sung có cột 'artist' và 'title'
-            if 'artist' in self.gtzan_metadata.columns and 'title' in self.gtzan_metadata.columns:
-                for _, row in self.gtzan_metadata.iterrows():
-                    ref_artist = str(row.get('artist', ''))
-                    ref_title = str(row.get('title', ''))
-                    
-                    artist_match = fuzz.token_set_ratio(artist.lower(), ref_artist.lower())
-                    title_match = fuzz.token_set_ratio(title.lower(), ref_title.lower())
-                    
-                    if artist_match > 85 and title_match > 85:
-                        return "true", f"Trùng metadata: {ref_artist} - {ref_title}", False
-                
-                # Nếu có metadata đầy đủ để đối chiếu và không thấy trùng
-                return "false", "Không trùng artist/title trong GTZAN reference metadata", False
+                if path_str in cache and cache[path_str]['size'] == size and cache[path_str]['mtime'] == mtime:
+                    new_cache[path_str] = cache[path_str]
+                else:
+                    fp_array = self._get_raw_fingerprint(path_str)
+                    new_cache[path_str] = {
+                        'size': size,
+                        'mtime': mtime,
+                        'fp': fp_array
+                    }
+                    cache_updated = True
+            except Exception as e:
+                logger.error(f"Lỗi tạo fingerprint cho {path_str}: {e}")
 
-        # 3. Không có dữ liệu để kết luận
-        return "unknown", "Thiếu GTZAN metadata/audio để xác nhận", True
+        self.reference_fps = new_cache
+
+        if cache_updated:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.cache_path, 'w', encoding='utf-8') as f:
+                json.dump(new_cache, f)
+
+    def calculate_ber(self, fp_candidate: List[int], fp_reference: List[int]) -> float:
+        if not fp_candidate or not fp_reference:
+            return 1.0
+        
+        c_len = len(fp_candidate)
+        r_len = len(fp_reference)
+        
+        short_fp, long_fp = (fp_candidate, fp_reference) if c_len < r_len else (fp_reference, fp_candidate)
+        
+        min_ber = 1.0
+        window_size = len(short_fp)
+        if window_size == 0: return 1.0
+        
+        for i in range(len(long_fp) - window_size + 1):
+            window = long_fp[i:i+window_size]
+            error_bits = 0
+            for a, b in zip(short_fp, window):
+                diff = a ^ b
+                # Đếm số bit 1 của phép XOR (tốc độ cao)
+                error_bits += bin(diff).count('1')
+            ber = error_bits / (window_size * 32.0)
+            if ber < min_ber:
+                min_ber = ber
+        return min_ber
+
+    def check_overlap(self, cand_audio_path: str, cand_artist: str, cand_title: str) -> Tuple[str, str, bool]:
+        """Trả về: (gtzan_overlap, basis, review_required)"""
+        fp_match = False
+        best_ber = 1.0
+        
+        if self.has_fpcalc and cand_audio_path and os.path.exists(cand_audio_path):
+            try:
+                cand_fp = self._get_raw_fingerprint(cand_audio_path)
+                for ref_path, ref_data in self.reference_fps.items():
+                    ber = self.calculate_ber(cand_fp, ref_data['fp'])
+                    if ber < best_ber:
+                        best_ber = ber
+                        
+                if best_ber <= self.cfg.ber_threshold:
+                    fp_match = True
+            except Exception as e:
+                logger.warning(f"Lỗi giải mã fingerprint ứng viên {cand_audio_path}: {e}")
+
+        if fp_match:
+            return "true", "fingerprint", False
+
+        meta_status = "none"
+        cand_norm = f"{str(cand_artist).lower()} {str(cand_title).lower()}".strip()
+        
+        if cand_norm and self.metadata_db:
+            best_score = 0
+            for ref_meta in self.metadata_db:
+                # B-05: Dùng fuzz.ratio thay vì fuzz.token_set_ratio
+                score = fuzz.ratio(cand_norm, ref_meta)
+                if score > best_score:
+                    best_score = score
+            
+            if best_score >= self.cfg.metadata_match_threshold:
+                meta_status = "high"
+            elif best_score >= self.cfg.metadata_review_threshold:
+                meta_status = "review"
+
+        if meta_status == "high":
+            return "true", "metadata", False
+
+        if self.is_reference_complete:
+            return "false", "fingerprint", False
+        else:
+            if meta_status == "review":
+                return "unknown", "none", True
+            else:
+                return "unknown", "none", True

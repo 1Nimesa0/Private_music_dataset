@@ -1,0 +1,14 @@
+# Environments
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data and logs
+data/
+logs/
+
+# Audio and DB files
+*.wav
+*.mp3
+*.db

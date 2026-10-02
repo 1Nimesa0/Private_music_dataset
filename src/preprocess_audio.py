@@ -1,58 +1,46 @@
-import librosa
+from pathlib import Path
+from typing import List, Dict, Any, Callable
 import soundfile as sf
-import os
 import numpy as np
 
-class AudioPreprocessor:
-    def __init__(self, target_sr=22050, duration=10, segments_per_song=2):
-        self.sr = target_sr
-        self.duration = duration
-        self.segments = segments_per_song
-        self.samples_per_segment = self.sr * self.duration
+def load_audio_mono(path: str | Path, sr: int) -> np.ndarray:
+    import librosa
+    audio, _ = librosa.load(path, sr=sr, mono=True)
+    return audio
 
-    def process_and_segment(self, input_path: str, output_dir: str, song_id: str) -> list:
-        """
-        Đọc file, convert mono, resample, cắt ra n đoạn.
-        KHÔNG DÙNG aggressive noise reduction để giữ Environment Target Domain.
-        """
-        # sr=None giữ nguyên sample rate ban đầu, librosa tự động convert sang Mono
-        y, orig_sr = librosa.load(input_path, sr=None, mono=True) 
-        
-        # Resample về chuẩn 22050Hz
-        if orig_sr != self.sr:
-            y = librosa.resample(y, orig_sr=orig_sr, target_sr=self.sr)
-            
-        total_samples = len(y)
-        min_required_samples = self.samples_per_segment * self.segments
-        
-        if total_samples < min_required_samples:
-            raise ValueError(f"Audio quá ngắn. Yêu cầu {min_required_samples} samples, có {total_samples}")
+def write_wav(path: str | Path, audio: np.ndarray, sr: int):
+    sf.write(path, audio, sr, subtype='PCM_16')
 
-        # Chọn điểm cắt (ví dụ đoạn 1 từ 20%, đoạn 2 từ 60% để âm thanh đa dạng)
-        start_points = [
-            int(total_samples * 0.2), 
-            int(total_samples * 0.6)
-        ]
+def process_song(input_path: str | Path, out_dir: str | Path, song_id: str, cfg, loader: Callable = load_audio_mono, writer: Callable = write_wav) -> List[Dict[str, Any]]:
+    from .segmentation import extract_segments, SegmentationError
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        audio = loader(input_path, cfg.sample_rate)
+    except Exception as e:
+        raise Exception(f"Failed to load audio: {e}")
         
-        generated_files = []
-        for i, start_idx in enumerate(start_points):
-            end_idx = start_idx + self.samples_per_segment
-            segment = y[start_idx:end_idx]
-            
-            # Khử đỉnh (Peak Normalization nhẹ) nếu clipping, không thay đổi noise floor
-            max_amp = np.max(np.abs(segment))
-            if max_amp > 1.0:
-                segment = segment / max_amp
-                
-            out_filename = f"{song_id}_seg{i+1}.wav"
-            out_path = os.path.join(output_dir, out_filename)
-            sf.write(out_path, segment, self.sr, subtype='PCM_16')
-            
-            generated_files.append({
-                'segment_id': f"{song_id}_seg{i+1}",
-                'file_path': out_path,
-                'start_time': start_idx / self.sr,
-                'end_time': end_idx / self.sr
-            })
-            
-        return generated_files
+    peak = np.max(np.abs(audio))
+    if peak > 1.0:
+        audio = audio / peak
+        
+    segments_meta = []
+    segs = extract_segments(audio, cfg.sample_rate, cfg)
+    
+    for idx, (seg_audio, start_idx, end_idx) in enumerate(segs):
+        from .metadata import make_segment_id
+        seg_id = make_segment_id(song_id, idx, "clean")
+        out_file = out_dir / f"{seg_id}.wav"
+        writer(out_file, seg_audio, cfg.sample_rate)
+        
+        segments_meta.append({
+            "segment_id": seg_id,
+            "start_time": start_idx / cfg.sample_rate,
+            "end_time": end_idx / cfg.sample_rate,
+            "file_path": str(out_file.relative_to(cfg.paths['output'].parent) if 'output' in cfg.paths else out_file),
+            "environment_type": "clean",
+            "parent_segment_id": "",
+            "augmentation_params": ""
+        })
+    return segments_meta

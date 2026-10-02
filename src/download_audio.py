@@ -1,90 +1,80 @@
-import os
+import time
+import hashlib
 import logging
 import requests
 import librosa
-import soundfile as sf
-import numpy as np
 from pathlib import Path
-from typing import Dict, Optional
+from src.state_store import StateStore
 
 logger = logging.getLogger(__name__)
 
-class AudioDownloader:
-    def __init__(self, output_dir: str, config):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.config = config
+def sha256_file(filepath: Path) -> str:
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
-    def download_and_validate(self, track: Dict) -> Optional[str]:
-        """
-        Tải file audio từ URL, kiểm tra các ngưỡng chất lượng (silence, clipping, RMS)
-        và lưu dưới định dạng chuẩn (WAV, mono, 22050Hz).
-        """
-        url = track.get('source_url')
-        if not url:
-            logger.warning(f"Track {track.get('title')} không có source_url hợp lệ.")
-            return None
+def download_candidates(cfg, state_store: StateStore, candidates_list: list, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    max_retries = cfg.download['max_retries']
+    base_backoff = cfg.download['backoff_base_sec']
+    min_interval = cfg.download['min_interval_sec']
+    timeout = cfg.download['timeout_sec']
+    req_duration = cfg.dataset['segments_per_song'] * cfg.dataset['segment_duration_sec']
 
-        track_id = track.get('source_id')
-        genre = track.get('genre', 'unknown')
+    for cand_dict in candidates_list:
+        source_id = cand_dict['source_id']
+        download_url = cand_dict['download_url']
+        dest_path = out_dir / f"{source_id}.mp3"
+        part_path = dest_path.with_suffix(".part")
+
+        if state_store.is_rejected(source_id):
+            continue
+
+        if state_store.is_downloaded(source_id) and dest_path.exists():
+            continue
+
+        success = False
+        for attempt in range(max_retries):
+            try:
+                time.sleep(min_interval)
+                response = requests.get(download_url, stream=True, timeout=timeout)
+                response.raise_for_status()
+
+                with open(part_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verify duration & decodability
+                try:
+                    duration = librosa.get_duration(path=part_path)
+                    if duration < req_duration:
+                        raise ValueError(f"Duration {duration}s < required {req_duration}s")
+                except Exception as e:
+                    raise ValueError(f"Audio decode/duration error: {e}")
+
+                # Atomic rename
+                part_path.rename(dest_path)
+                file_hash = sha256_file(dest_path)
+                state_store.mark_downloaded(source_id, str(dest_path), file_hash)
+                logger.info(f"Downloaded {source_id}")
+                success = True
+                break
+
+            except requests.RequestException as e:
+                logger.warning(f"Download failed for {source_id} (Attempt {attempt+1}): {e}")
+                if part_path.exists():
+                    part_path.unlink()
+                time.sleep(base_backoff * (2 ** attempt))
+            except ValueError as e:
+                logger.warning(f"Verification failed for {source_id}: {e}")
+                if part_path.exists():
+                    part_path.unlink()
+                state_store.log_rejection(source_id, str(e))
+                break # Don't retry decoding errors
         
-        genre_dir = self.output_dir / genre
-        genre_dir.mkdir(parents=True, exist_ok=True)
-        local_filename = genre_dir / f"{track_id}.wav"
-
-        # Nếu đã tải rồi thì bỏ qua
-        if local_filename.exists():
-            return str(local_filename)
-
-        try:
-            # Tải file từ URL
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            temp_file = genre_dir / f"temp_{track_id}.mp3"
-            with open(temp_file, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
-            # Load và chuẩn hóa bằng librosa (mono, 22050Hz)
-            target_sr = 22050
-            y, sr = librosa.load(str(temp_file), sr=target_sr, mono=True)
-            
-            # --- KIỂM TRA CHẤT LƯỢNG (Quality Control) ---
-            # 1. Kiểm tra silence ratio
-            silence_threshold = 0.01
-            silence_ratio = np.sum(np.abs(y) < silence_threshold) / len(y)
-            if silence_ratio > self.config.quality.max_silence_ratio:
-                logger.warning(f"Reject {track_id}: Tỷ lệ khoảng lặng quá cao ({silence_ratio:.2f})")
-                temp_file.unlink(missing_ok=True)
-                return None
-
-            # 2. Kiểm tra clipping ratio (biên độ chạm ngưỡng 1.0)
-            clipping_ratio = np.sum(np.abs(y) >= 0.99) / len(y)
-            if clipping_ratio > self.config.quality.max_clipping_ratio:
-                logger.warning(f"Reject {track_id}: Tỷ lệ clipping quá cao ({clipping_ratio:.2f})")
-                temp_file.unlink(missing_ok=True)
-                return None
-
-            # 3. Kiểm tra năng lượng RMS (dBFS)
-            rms = librosa.feature.rms(y=y)[0]
-            dbfs = 20 * np.log10(np.maximum(np.mean(rms), 1e-5))
-            if dbfs < self.config.quality.min_rms_dbfs:
-                logger.warning(f"Reject {track_id}: Năng lượng RMS quá thấp ({dbfs:.2f} dBFS)")
-                temp_file.unlink(missing_ok=True)
-                return None
-
-            # Lưu file chuẩn WAV
-            sf.write(str(local_filename), y, target_sr)
-            
-            # Xóa file tạm
-            if temp_file.exists():
-                temp_file.unlink()
-
-            logger.info(f"Đã tải và vượt qua kiểm định chất lượng: {local_filename}")
-            return str(local_filename)
-
-        except Exception as e:
-            logger.error(f"Lỗi khi tải hoặc xử lý track {track_id}: {e}")
-            return None
+        if not success and not state_store.is_rejected(source_id):
+            state_store.log_rejection(source_id, "Max retries exceeded")

@@ -1,24 +1,67 @@
 dataset:
-  target_genres: 10
+  genres: [blues, classical, country, disco, hiphop, jazz, metal, pop, reggae, rock]
   target_songs_per_genre: 15
   segments_per_song: 2
   max_songs_per_artist: 2
   sample_rate: 22050
-  channels: 1 # mono
+  channels: 1
   segment_duration_sec: 10.0
+  random_seed: 42
+
+splits:                          
+  strategy: artist_disjoint      
+  adaptation: 0.6
+  validation: 0.1
+  test: 0.2
+  demo: 0.1
 
 quality_thresholds:
-  max_silence_ratio: 0.3
+  max_silence_ratio: 0.3         
   max_clipping_ratio: 0.01
   min_rms_dbfs: -45
   min_duration_tolerance_sec: 0.5
+  silence_frame_dbfs: -50.0      
+
+segmentation:
+  edge_margin_ratio: 0.1
+  offset_candidates: [0.5, 0.25, 0.75, 0.0, 1.0]
 
 environment_constraints:
   min_environment_types: 3
-  min_non_clean_ratio: 0.5
+  min_non_clean_ratio: 0.5       
+  min_test_real_samples: 50
+
+genre_mapping:
+  min_genre_confidence: 1.0
+
+licensing:
+  allowed_cc: [by, by-sa, by-nc, by-nc-sa]
+  allow_nd: false
+
+gtzan_overlap:
+  ber_threshold: 0.35            
+  metadata_match_threshold: 92
+  metadata_review_threshold: 75
+  min_reference_files: 1000
+
+download:
+  oversample_candidates: 50
+  max_retries: 5
+  backoff_base_sec: 1.0
+  min_interval_sec: 0.5
+  timeout_sec: 30
+
+augmentation:
+  max_variants_per_segment: 1
+  effects:
+    simulated_reverb:         {rt60_sec: [0.3, 1.2], wet_mix: [0.2, 0.5]}
+    simulated_noise:          {snr_db: [5, 20], color: [white, pink, brown]}
+    simulated_bandlimited_mic: {highpass_hz: [150, 400], lowpass_hz: [3000, 7000]}
 
 paths:
-  gtzan_reference: "data/gtzan_reference/"
-  local_audio: "data/local_audio/"
-  quarantine: "data/quarantine/"
-  output: "data/final_dataset/"
+  gtzan_reference: data/gtzan_reference
+  local_audio: data/local_audio
+  quarantine: data/quarantine
+  interim: data/interim
+  output: data/final_dataset
+  logs: logs

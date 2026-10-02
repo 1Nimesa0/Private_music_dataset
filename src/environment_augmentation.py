@@ -1,93 +1,146 @@
 import os
-import logging
+import json
+import hashlib
 import numpy as np
-import librosa
+import scipy.signal
 import soundfile as sf
 import pandas as pd
-from typing import List
+from typing import List, Tuple
+from src.preprocess_audio import load_audio_mono
+from src.segmentation import check_segment_quality, SegmentationError
+from src.metadata import make_segment_id
 
-logger = logging.getLogger(__name__)
+class AugmentationError(Exception):
+    pass
 
-class EnvironmentAugmenter:
-    def __init__(self, metadata_path: str):
-        self.metadata_path = metadata_path
-        self.env_types = ['clean', 'room_reverb', 'background_noise', 'low_quality_mic']
-        
-    def _add_white_noise(self, y: np.ndarray, snr_db: float = 15.0) -> np.ndarray:
-        signal_power = np.mean(y ** 2)
-        noise_power = signal_power / (10 ** (snr_db / 10))
-        noise = np.random.normal(0, np.sqrt(noise_power), len(y))
-        return y + noise
-        
-    def _apply_simple_reverb(self, y: np.ndarray) -> np.ndarray:
-        # Giả lập reverb đơn giản bằng cách cộng dồn tín hiệu delay
-        delay_samples = int(22050 * 0.05) # 50ms delay
-        decay = 0.5
-        y_reverb = np.copy(y)
-        y_reverb[delay_samples:] += y[:-delay_samples] * decay
-        return y_reverb / np.max(np.abs(y_reverb)) # Normalize
+def _get_rng(seed: int, segment_id: str) -> np.random.Generator:
+    """I-6: Sinh RNG ổn định từ seed và id."""
+    hash_val = int(hashlib.sha256(f"{seed}_{segment_id}".encode()).hexdigest(), 16)
+    return np.random.default_rng(hash_val % (2**32))
 
-    def _apply_low_pass_filter(self, y: np.ndarray) -> np.ndarray:
-        # Giả lập low-quality mic bằng cách cắt tần số cao
-        # Bằng thuật toán rolling mean đơn giản hoặc scipy.signal
-        window_size = 5
-        y_filtered = np.convolve(y, np.ones(window_size)/window_size, mode='same')
-        return y_filtered
+def apply_simulated_reverb(audio: np.ndarray, sr: int, rng: np.random.Generator, params: dict) -> np.ndarray:
+    rt60 = rng.uniform(params['rt60_sec'][0], params['rt60_sec'][1])
+    wet_mix = rng.uniform(params['wet_mix'][0], params['wet_mix'][1])
+    
+    t = np.arange(0, int(sr * rt60)) / sr
+    impulse_response = np.exp(-t * (6.91 / rt60)) * rng.standard_normal(len(t))
+    
+    wet = scipy.signal.fftconvolve(audio, impulse_response, mode='full')[:len(audio)]
+    max_wet = np.max(np.abs(wet))
+    if max_wet > 0:
+        wet = wet / max_wet
+    else:
+        return audio
+        
+    return (1 - wet_mix) * audio + wet_mix * wet
 
-    def process_dataset(self, target_non_clean_ratio: float = 0.5):
-        """
-        Đảm bảo dataset đạt tỉ lệ đa dạng môi trường.
-        Tuyệt đối không can thiệp vào các sample thuộc tập 'test' hoặc 'private_test'.
-        """
-        df = pd.read_csv(self.metadata_path)
-        
-        # Chỉ lấy các sample thuộc tập train/val để xét augmentation[cite: 1]
-        augmentable_indices = df[~df['split'].isin(['test', 'private_test'])].index.tolist()
-        
-        current_non_clean = len(df[df['environment_type'] != 'clean'])
-        total_samples = len(df)
-        
-        samples_needed = int(total_samples * target_non_clean_ratio) - current_non_clean
-        
-        if samples_needed <= 0:
-            logger.info("Dataset đã đạt đủ tỉ lệ non-clean hợp lệ.")
-            return
+def _generate_noise(length: int, color: str, rng: np.random.Generator) -> np.ndarray:
+    white = rng.standard_normal(length)
+    if color == 'white':
+        return white
+    elif color == 'brown':
+        return np.cumsum(white)
+    elif color == 'pink':
+        # Pink noise approximation
+        b = [0.049922035, -0.095993537, 0.050612699, -0.004408786]
+        a = [1, -2.494956002, 2.017265875, -0.522189400]
+        return scipy.signal.lfilter(b, a, white)
+    return white
 
-        logger.info(f"Cần áp dụng augmentation cho {samples_needed} samples thuộc tập train/val.")
+def apply_simulated_noise(audio: np.ndarray, sr: int, rng: np.random.Generator, params: dict) -> np.ndarray:
+    snr_db = rng.uniform(params['snr_db'][0], params['snr_db'][1])
+    color = rng.choice(params['color'])
+    
+    signal_power = np.mean(audio**2)
+    if signal_power == 0:
+        return audio
         
-        # Chọn ngẫu nhiên các sample clean trong tập augmentable để xử lý
-        clean_augmentable_indices = df.loc[augmentable_indices]
-        clean_augmentable_indices = clean_augmentable_indices[clean_augmentable_indices['environment_type'] == 'clean'].index.tolist()
+    noise = _generate_noise(len(audio), color, rng)
+    noise_power = np.mean(noise**2)
+    
+    if noise_power > 0:
+        target_noise_power = signal_power / (10**(snr_db / 10))
+        noise = noise * np.sqrt(target_noise_power / noise_power)
         
-        np.random.shuffle(clean_augmentable_indices)
-        selected_indices = clean_augmentable_indices[:samples_needed]
+    return audio + noise
+
+def apply_simulated_bandlimited_mic(audio: np.ndarray, sr: int, rng: np.random.Generator, params: dict) -> np.ndarray:
+    hp = rng.uniform(params['highpass_hz'][0], params['highpass_hz'][1])
+    lp = rng.uniform(params['lowpass_hz'][0], params['lowpass_hz'][1])
+    b, a = scipy.signal.butter(4, [hp, lp], btype='bandpass', fs=sr)
+    return scipy.signal.lfilter(b, a, audio)
+
+def augment_dataset(df: pd.DataFrame, cfg, out_dir: str) -> pd.DataFrame:
+    os.makedirs(out_dir, exist_ok=True)
+    aug_cfg = cfg.augmentation
+    
+    clean_mask = df['parent_segment_id'].isna() | (df['parent_segment_id'] == "")
+    df_clean = df[clean_mask]
+    
+    # Tính toán hạn ngạch D-4
+    df_adv = df_clean[df_clean['split'].isin(['adaptation', 'validation', 'demo'])]
+    total_clean_adv = len(df_adv)
+    min_ratio = cfg.environment_constraints['min_non_clean_ratio']
+    
+    # N / (total_clean_adv + N) >= min_ratio => N >= (min_ratio * total_clean_adv) / (1 - min_ratio)
+    required_variants = 0
+    if min_ratio < 1.0:
+        required_variants = int(np.ceil((min_ratio * total_clean_adv) / (1 - min_ratio)))
+    else:
+        required_variants = total_clean_adv * aug_cfg['max_variants_per_segment']
         
-        for idx in selected_indices:
-            row = df.loc[idx]
-            file_path = row['file_path']
+    # Tính toán số lượng hiệu ứng để cân bằng
+    effects_pool = [
+        ('simulated_reverb', apply_simulated_reverb, aug_cfg['effects']['simulated_reverb']),
+        ('simulated_noise', apply_simulated_noise, aug_cfg['effects']['simulated_noise']),
+        ('simulated_bandlimited_mic', apply_simulated_bandlimited_mic, aug_cfg['effects']['simulated_bandlimited_mic'])
+    ]
+    
+    new_rows = []
+    variants_created = 0
+    
+    for idx, row in df_clean.iterrows():
+        rng = _get_rng(cfg.dataset['random_seed'], row['segment_id'])
+        
+        # Test split: đúng 1 biến thể (test_shifted)
+        if row['split'] == 'test':
+            effects_to_apply = [rng.choice(effects_pool)]
+        else:
+            if variants_created < required_variants:
+                effects_to_apply = [effects_pool[variants_created % len(effects_pool)]]
+                variants_created += 1
+            else:
+                continue
+                
+        audio, sr = load_audio_mono(row['file_path'], cfg.dataset['sample_rate'])
+        if np.max(np.abs(audio)) == 0:
+            continue
             
+        for effect_name, effect_func, params in effects_to_apply:
             try:
-                y, sr = librosa.load(file_path, sr=None)
+                aug_audio = effect_func(audio, sr, rng, params)
                 
-                # Chọn ngẫu nhiên 1 trong 3 hiệu ứng môi trường
-                env_choice = np.random.choice(['room_reverb', 'background_noise', 'low_quality_mic'])
+                if np.max(np.abs(aug_audio)) > 1.0:
+                    aug_audio = aug_audio / np.max(np.abs(aug_audio))
                 
-                if env_choice == 'room_reverb':
-                    y_aug = self._apply_simple_reverb(y)
-                elif env_choice == 'background_noise':
-                    y_aug = self._add_white_noise(y, snr_db=np.random.uniform(10, 20))
-                else:
-                    y_aug = self._apply_low_pass_filter(y)
-                    
-                # Ghi đè file hoặc lưu thành file mới (tùy chiến lược đường dẫn)
-                sf.write(file_path, y_aug, sr)
+                # Check QC lại sau augment
+                check_segment_quality(aug_audio, sr, cfg)
                 
-                # Cập nhật metadata
-                df.at[idx, 'environment_type'] = env_choice
+                new_seg_id = make_segment_id(row['song_id'], int(row['start_time']), f"aug_{effect_name}")
+                out_path = os.path.join(out_dir, f"{new_seg_id}.wav")
+                sf.write(out_path, aug_audio, sr, subtype='PCM_16')
                 
-            except Exception as e:
-                logger.error(f"Lỗi augmentation file {file_path}: {e}")
+                new_row = row.copy()
+                new_row['segment_id'] = new_seg_id
+                new_row['parent_segment_id'] = row['segment_id']
+                new_row['environment_type'] = effect_name
+                new_row['augmentation_params'] = json.dumps({'effect': effect_name, 'seed': cfg.dataset['random_seed']})
+                new_row['file_path'] = out_path
+                new_rows.append(new_row)
+            except SegmentationError:
+                pass # Lọc bỏ nếu augment làm rớt QC
                 
-        # Lưu lại metadata đã cập nhật
-        df.to_csv(self.metadata_path, index=False)
-        logger.info("Hoàn tất quy trình Environment Augmentation.")
+    if variants_created < required_variants and len(df_adv) > 0:
+        print(f"Warning: Không đạt đủ {required_variants} variants yêu cầu do QC fail.")
+        
+    return pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)

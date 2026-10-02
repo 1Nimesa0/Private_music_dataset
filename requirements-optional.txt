@@ -1,0 +1,2 @@
+# Cần có fpcalc cài đặt trên hệ điều hành (không qua pip)
+pyacoustid
